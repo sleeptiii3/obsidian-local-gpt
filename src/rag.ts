@@ -5,7 +5,6 @@ import { OllamaEmbeddings } from "./ollama-embeddings";
 import { preprocessContent, splitContent } from "./text-processing";
 
 const MAX_DEPTH = 10;
-const MAX_SEARCH_RESULTS = 6;
 const documentCache = new Map<string, { mtime: number; embedding?: number[] }>();
 
 interface ProcessingContext {
@@ -107,6 +106,7 @@ export async function createVectorStore(
     if (doc.metadata.source !== currentDocumentPath) {
       const content = preprocessContent(doc.pageContent);
       const chunks = splitContent(content);
+      console.log(chunks);
       for (const chunk of chunks) {
         if (!uniqueChunks.has(chunk)) {
           uniqueChunks.add(chunk);
@@ -137,20 +137,60 @@ export async function queryVectorStore(
   query: string,
   vectorStore: MemoryVectorStore
 ): Promise<string> {
+  const MAX_SEARCH_RESULTS = 10;
+  const HIGH_SCORE_THRESHOLD = 0.51;
+  const MAX_LOW_SCORE_RESULTS = 5;
+
   const results = await vectorStore.similaritySearchWithScore(query, MAX_SEARCH_RESULTS);
   console.log("Results:", results);
   
   const groupedResults = results.reduce((acc, [doc, score]) => {
     const basename = doc.metadata.basename || 'Unknown';
     if (!acc[basename]) {
-      acc[basename] = [];
+      acc[basename] = { 
+        highScore: [], 
+        lowScore: [], 
+        createdTime: getCreatedTime(doc)
+      };
     }
-    acc[basename].push(doc.pageContent);
+    if (score >= HIGH_SCORE_THRESHOLD) {
+      acc[basename].highScore.push(doc.pageContent);
+    } else {
+      acc[basename].lowScore.push(doc.pageContent);
+    }
     return acc;
-  }, {} as Record<string, string[]>);
+  }, {} as Record<string, { highScore: string[], lowScore: string[], createdTime: number }>);
 
-  return Object.entries(groupedResults)
-    .map(([basename, contents]) => `${basename}\n${contents.join('\n\n')}`)
-    .join('\n\n')
-    .trim();
+  let totalLowScoreCount = 0;
+  const finalResults = Object.entries(groupedResults)
+    .sort(([, a], [, b]) => b.createdTime - a.createdTime) // Sort by creation time, newest first
+    .map(([basename, { highScore, lowScore }]) => {
+      const highScoreContent = highScore.join('\n\n');
+      let lowScoreContent = '';
+      
+      if (totalLowScoreCount < MAX_LOW_SCORE_RESULTS) {
+        const remainingSlots = MAX_LOW_SCORE_RESULTS - totalLowScoreCount;
+        const lowScoreToInclude = lowScore.slice(0, remainingSlots);
+        lowScoreContent = lowScoreToInclude.join('\n\n');
+        totalLowScoreCount += lowScoreToInclude.length;
+      }
+
+      const content = [highScoreContent, lowScoreContent].filter(Boolean).join('\n\n');
+      return `${basename}\n${content}`;
+    });
+
+  return finalResults.join('\n\n').trim();
+}
+
+function getCreatedTime(doc: Document): number {
+  const frontmatterMatch = doc.pageContent.match(/^---\n([\s\S]*?)\n---/);
+  if (frontmatterMatch) {
+    const frontmatter = frontmatterMatch[1];
+    const createdMatch = frontmatter.match(/created:\s*(\d{4}-\d{2}-\d{2})/);
+    if (createdMatch) {
+      return new Date(createdMatch[1]).getTime();
+    }
+  }
+
+  return doc.metadata.stat.ctime;
 }
