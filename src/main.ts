@@ -12,6 +12,9 @@ import {
 } from "./interfaces";
 import { OllamaAIProvider } from "./providers/ollama";
 import { OpenAICompatibleAIProvider } from "./providers/openai-compatible";
+import { startProcessing, createVectorStore, queryVectorStore, getLinkedFiles } from "./rag";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { Document } from "langchain/document";
 
 export default class LocalGPT extends Plugin {
 	settings: LocalGPTSettings;
@@ -138,6 +141,7 @@ export default class LocalGPT extends Plugin {
 
 		const aiProvider = getAIProvider(this.settings.defaults.provider);
 
+		// Обрабатываем изображения (оставляем без изменений)
 		const regexp = /!\[\[(.+?\.(?:png|jpe?g))]]/gi;
 		const fileNames = Array.from(
 			selectedText.matchAll(regexp),
@@ -178,6 +182,9 @@ export default class LocalGPT extends Plugin {
 					}),
 				)
 			).filter(Boolean) || [];
+
+		// Обрабатываем выделенный текст
+		selectedText = await this.processActiveFile(selectedText);
 
 		const aiRequest = {
 			text: selectedText,
@@ -226,6 +233,59 @@ export default class LocalGPT extends Plugin {
 			});
 	}
 
+	async processActiveFile(selectedText: string): Promise<string> {
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile) {
+			console.log("No active file");
+			return selectedText;
+		}
+
+		const linkedFiles = getLinkedFiles(
+			selectedText,
+			this.app.vault,
+			this.app.metadataCache,
+			activeFile.path
+		);
+		
+		if (linkedFiles.length === 0) {
+			console.log("No linked files found in the selected text");
+			return selectedText;
+		}
+
+		try {
+			console.log("Processing linked files:", linkedFiles.map(f => f.path));
+			const processedDocs = await startProcessing(activeFile, this.app.vault, this.app.metadataCache);
+			console.log("Processed docs:", processedDocs);
+			
+			if (processedDocs.size === 0) {
+				return selectedText;
+			}
+
+			const ollamaUrl = this.getOllamaUrl();
+			if (!ollamaUrl) {
+				throw new Error("Ollama URL is not defined");
+			}
+
+			const vectorStore = await createVectorStore(Array.from(processedDocs.values()), ollamaUrl, activeFile.path);
+			const relevantContext = await queryVectorStore(selectedText, vectorStore);
+			
+			console.log("Relevant context:\n", relevantContext);
+			if (relevantContext.trim()) {
+				return `${selectedText}\n\nRelevant context:\n${relevantContext}`;
+			}
+		} catch (error) {
+			console.error("Error processing RAG:", error);
+			new Notice(`Error processing related documents: ${error.message}. Continuing with original text.`);
+		}
+
+		return selectedText;
+	}
+	  
+	  private getOllamaUrl(): string | undefined {
+		const provider = this.settings.providers[this.settings.defaults.provider] as OllamaProvider;
+		return provider.ollamaUrl;
+	  }
+
 	onunload() {
 		document.removeEventListener("keydown", this.escapeHandler);
 		window.clearInterval(this.updatingInterval);
@@ -253,7 +313,10 @@ export default class LocalGPT extends Plugin {
 				// @ts-ignore
 				delete loadedData.defaultModel;
 				// @ts-ignore
-				loadedData.selectedProvider = DEFAULT_SETTINGS.selectedProvider;
+				loadedData.providers.openaiCompatible &&
+					// @ts-ignore
+					(loadedData.providers.openaiCompatible.apiKey = "");
+
 				loadedData._version = 2;
 			}
 			if (loadedData._version < 3) {
@@ -271,10 +334,6 @@ export default class LocalGPT extends Plugin {
 					// @ts-ignore
 					loadedData.providers[key].type = key;
 				});
-				// @ts-ignore
-				loadedData.providers.openaiCompatible &&
-					// @ts-ignore
-					(loadedData.providers.openaiCompatible.apiKey = "");
 
 				loadedData._version = 3;
 			}
